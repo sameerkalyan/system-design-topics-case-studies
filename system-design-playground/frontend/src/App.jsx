@@ -1,7 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
 
-const API_BASE = 'http://localhost:5001';
-
 const strategyOptions = [
   { value: 'round-robin', label: 'Round robin' },
   { value: 'least-connections', label: 'Least connections' },
@@ -15,6 +13,7 @@ export default function App() {
   const [jobPayload, setJobPayload] = useState('send-email');
   const [jobResult, setJobResult] = useState(null);
   const [error, setError] = useState('');
+  const [burstCount, setBurstCount] = useState(12);
 
   const nodes = dashboard?.nodes || [];
   const queueDepth = dashboard?.queueDepth || 0;
@@ -23,14 +22,30 @@ export default function App() {
   const conceptCards = useMemo(() => ([
     { title: 'Load balancing', value: dashboard?.strategy || 'round-robin' },
     { title: 'Healthy nodes', value: `${healthyCount}/${nodes.length || 0}` },
-    { title: 'Rate-limited requests', value: dashboard?.requestsThisMinute || 0 },
+    { title: 'Requests this minute', value: dashboard?.requestsThisMinute || 0 },
     { title: 'Queue depth', value: queueDepth }
   ]), [dashboard, healthyCount, nodes.length, queueDepth]);
 
-  async function refreshDashboard() {
-    const res = await fetch(`${API_BASE}/api/dashboard`);
+  async function api(path, options = {}) {
+    const res = await fetch(path, {
+      headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
+      ...options
+    });
+
     const data = await res.json();
-    setDashboard(data);
+    if (!res.ok) {
+      throw new Error(data.error || data.message || 'Request failed');
+    }
+    return data;
+  }
+
+  async function refreshDashboard() {
+    try {
+      const data = await api('/api/dashboard');
+      setDashboard(data);
+    } catch (err) {
+      setError(err.message);
+    }
   }
 
   useEffect(() => {
@@ -40,50 +55,91 @@ export default function App() {
   }, []);
 
   async function updateStrategy(strategy) {
-    await fetch(`${API_BASE}/api/strategy`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ strategy })
-    });
-    refreshDashboard();
+    try {
+      await api('/api/strategy', {
+        method: 'POST',
+        body: JSON.stringify({ strategy })
+      });
+      refreshDashboard();
+    } catch (err) {
+      setError(err.message);
+    }
   }
 
   async function fetchResource() {
     setError('');
-    const res = await fetch(`${API_BASE}/api/resource/${resourceId}`);
-    const data = await res.json();
-
-    if (!res.ok) {
-      setError(data.error || 'Request failed');
-      return;
+    try {
+      const data = await api(`/api/resource/${resourceId}`);
+      setResponses(prev => [data, ...prev].slice(0, 8));
+      refreshDashboard();
+    } catch (err) {
+      setError(err.message);
     }
-
-    setResponses(prev => [data, ...prev].slice(0, 8));
-    refreshDashboard();
   }
 
   async function toggleNode(nodeId) {
-    await fetch(`${API_BASE}/api/nodes/${nodeId}/toggle`, { method: 'POST' });
-    refreshDashboard();
+    try {
+      await api(`/api/nodes/${nodeId}/toggle`, { method: 'POST' });
+      refreshDashboard();
+    } catch (err) {
+      setError(err.message);
+    }
   }
 
   async function enqueueJob() {
-    const res = await fetch(`${API_BASE}/api/jobs`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ payload: jobPayload })
-    });
-
-    const data = await res.json();
-    setJobResult(data);
-    refreshDashboard();
+    try {
+      const data = await api('/api/jobs', {
+        method: 'POST',
+        body: JSON.stringify({ payload: jobPayload })
+      });
+      setJobResult(data);
+      refreshDashboard();
+    } catch (err) {
+      setError(err.message);
+    }
   }
 
   async function processJob() {
-    const res = await fetch(`${API_BASE}/api/jobs/process`, { method: 'POST' });
-    const data = await res.json();
-    setJobResult(data);
-    refreshDashboard();
+    try {
+      const data = await api('/api/jobs/process', { method: 'POST' });
+      setJobResult(data);
+      refreshDashboard();
+    } catch (err) {
+      setError(err.message);
+      setJobResult({ message: err.message, concept: 'retry-storm' });
+      refreshDashboard();
+    }
+  }
+
+  async function toggleCache() {
+    try {
+      await api('/api/cache/toggle', { method: 'POST' });
+      refreshDashboard();
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
+  async function toggleRetryStorm() {
+    try {
+      await api('/api/retry-storm/toggle', { method: 'POST' });
+      refreshDashboard();
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
+  async function triggerSurge() {
+    try {
+      const data = await api('/api/surge', {
+        method: 'POST',
+        body: JSON.stringify({ count: Number(burstCount) })
+      });
+      setJobResult(data);
+      refreshDashboard();
+    } catch (err) {
+      setError(err.message);
+    }
   }
 
   return (
@@ -126,6 +182,15 @@ export default function App() {
             </select>
           </label>
 
+          <div className="toggle-row">
+            <button onClick={toggleCache}>
+              Cache: {dashboard?.cacheEnabled ? 'on' : 'off'}
+            </button>
+            <button onClick={toggleRetryStorm}>
+              Retry storm: {dashboard?.retryStormMode ? 'on' : 'off'}
+            </button>
+          </div>
+
           <div className="node-list">
             {nodes.map(node => (
               <div key={node.id} className="node-card">
@@ -158,17 +223,28 @@ export default function App() {
             <input value={resourceId} onChange={(e) => setResourceId(e.target.value)} />
           </label>
 
-          <button className="primary" onClick={fetchResource}>Fetch resource</button>
+          <div className="button-row">
+            <button className="primary" onClick={fetchResource}>Fetch resource</button>
+            <input
+              type="number"
+              min="1"
+              max="50"
+              value={burstCount}
+              onChange={(e) => setBurstCount(e.target.value)}
+            />
+            <button onClick={triggerSurge}>Trigger surge</button>
+          </div>
+
           {error ? <p className="error-text">{error}</p> : null}
 
           <div className="response-list">
             {responses.map((item, index) => (
               <div key={`${item.servedBy || item.data?.resourceId}-${index}`} className="response-card">
                 <strong>{item.cache === 'hit' ? 'Cache hit' : 'Cache miss'}</strong>
-                <p>Served by: {item.servedBy || item.data?.servedBy || 'cache'}</p>
+                <p>Served by: {item.servedBy || 'unknown'}</p>
                 <p>Strategy: {item.strategy || 'cached'}</p>
                 <p>Delay: {item.delay || 0}ms</p>
-                <p>Resource: {item.data?.resourceId || item.data?.data?.resourceId}</p>
+                <p>Resource: {item.data?.resourceId}</p>
               </div>
             ))}
           </div>
@@ -204,6 +280,23 @@ export default function App() {
                 <span>{job.id}</span>
                 <span>{job.status}</span>
                 <span>attempts: {job.attempts}</span>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        <section className="panel panel-wide">
+          <div className="panel-head">
+            <h2>Recent system events</h2>
+            <span>Concepts: observability, debugging</span>
+          </div>
+
+          <div className="event-list">
+            {(dashboard?.trafficLog || []).map((event, index) => (
+              <div key={`${event.time}-${index}`} className="event-item">
+                <strong>{event.type}</strong>
+                <span>{event.ok ? 'ok' : 'failed'}</span>
+                <code>{JSON.stringify(event)}</code>
               </div>
             ))}
           </div>
