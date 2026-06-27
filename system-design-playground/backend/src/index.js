@@ -13,8 +13,13 @@ const state = {
   requestLog: [],
   queue: [],
   processedJobs: [],
+  deadLetterJobs: [],
   cache: new Map(),
   balancerIndex: 0,
+  nodeSequence: 4,
+  trafficBurstEnabled: false,
+  retryStormMode: false,
+  cacheEnabled: true,
   nodes: [
     { id: 'api-a', weight: 1, baseDelay: 120, healthy: true, activeConnections: 0, handled: 0, failed: 0 },
     { id: 'api-b', weight: 2, baseDelay: 260, healthy: true, activeConnections: 0, handled: 0, failed: 0 },
@@ -90,7 +95,8 @@ function wait(ms) {
 async function processByNode(node, payload) {
   node.activeConnections += 1;
   const jitter = Math.floor(Math.random() * 120);
-  const simulatedDelay = node.baseDelay + jitter;
+  const burstDelay = state.trafficBurstEnabled ? 180 : 0;
+  const simulatedDelay = node.baseDelay + jitter + burstDelay;
 
   try {
     await wait(simulatedDelay);
@@ -119,6 +125,10 @@ function getCacheKey(resourceId) {
 }
 
 function getCache(resourceId) {
+  if (!state.cacheEnabled) {
+    return null;
+  }
+
   const key = getCacheKey(resourceId);
   const entry = state.cache.get(key);
 
@@ -132,11 +142,31 @@ function getCache(resourceId) {
 }
 
 function setCache(resourceId, value, ttlMs = 15000) {
+  if (!state.cacheEnabled) {
+    return;
+  }
+
   const key = getCacheKey(resourceId);
   state.cache.set(key, {
     value,
     expiresAt: now() + ttlMs
   });
+}
+
+function summarizeState() {
+  return {
+    strategy: state.strategy,
+    rateLimitPerMinute: state.rateLimitPerMinute,
+    queueDepth: state.queue.length,
+    processedJobs: state.processedJobs.slice(0, 8),
+    deadLetterJobs: state.deadLetterJobs.slice(0, 8),
+    cacheKeys: Array.from(state.cache.keys()),
+    cacheEnabled: state.cacheEnabled,
+    nodes: state.nodes,
+    requestsThisMinute: state.requestLog.length,
+    trafficBurstEnabled: state.trafficBurstEnabled,
+    retryStormMode: state.retryStormMode
+  };
 }
 
 app.get('/api/health', (req, res) => {
@@ -145,9 +175,15 @@ app.get('/api/health', (req, res) => {
     rateLimitPerMinute: state.rateLimitPerMinute,
     queueDepth: state.queue.length,
     processedJobs: state.processedJobs.length,
+    deadLetterJobs: state.deadLetterJobs.length,
     cacheEntries: state.cache.size,
+    cacheEnabled: state.cacheEnabled,
     nodes: state.nodes
   });
+});
+
+app.get('/api/dashboard', (req, res) => {
+  res.json(summarizeState());
 });
 
 app.post('/api/strategy', (req, res) => {
@@ -172,6 +208,23 @@ app.post('/api/nodes/:id/toggle', (req, res) => {
   return res.json({ ok: true, node });
 });
 
+app.post('/api/nodes', (req, res) => {
+  const { baseDelay = 140, weight = 1 } = req.body;
+  const node = {
+    id: `api-${String.fromCharCode(96 + state.nodeSequence)}`,
+    weight: Number(weight) || 1,
+    baseDelay: Number(baseDelay) || 140,
+    healthy: true,
+    activeConnections: 0,
+    handled: 0,
+    failed: 0
+  };
+
+  state.nodeSequence += 1;
+  state.nodes.push(node);
+  return res.status(201).json({ ok: true, node, totalNodes: state.nodes.length });
+});
+
 app.post('/api/rate-limit', (req, res) => {
   const { rateLimitPerMinute } = req.body;
   if (!Number.isFinite(rateLimitPerMinute) || rateLimitPerMinute < 1) {
@@ -180,6 +233,77 @@ app.post('/api/rate-limit', (req, res) => {
 
   state.rateLimitPerMinute = rateLimitPerMinute;
   return res.json({ ok: true, rateLimitPerMinute });
+});
+
+app.post('/api/cache/toggle', (req, res) => {
+  state.cacheEnabled = !state.cacheEnabled;
+  if (!state.cacheEnabled) {
+    state.cache.clear();
+  }
+
+  return res.json({ ok: true, cacheEnabled: state.cacheEnabled });
+});
+
+app.post('/api/traffic-burst/toggle', (req, res) => {
+  state.trafficBurstEnabled = !state.trafficBurstEnabled;
+  return res.json({ ok: true, trafficBurstEnabled: state.trafficBurstEnabled });
+});
+
+app.post('/api/retry-storm/toggle', (req, res) => {
+  state.retryStormMode = !state.retryStormMode;
+  return res.json({ ok: true, retryStormMode: state.retryStormMode });
+});
+
+app.post('/api/simulate-burst', async (req, res) => {
+  const { count = 10, resourceId = 'burst-resource' } = req.body;
+  const total = Math.min(Number(count) || 10, 30);
+  const results = [];
+
+  for (let i = 0; i < total; i += 1) {
+    if (!checkRateLimit()) {
+      results.push({ status: 429, error: 'Rate limit exceeded' });
+      continue;
+    }
+
+    const cached = getCache(resourceId);
+    if (cached) {
+      results.push({ status: 200, cache: 'hit', servedBy: 'cache' });
+      continue;
+    }
+
+    const node = chooseNode();
+    if (!node) {
+      results.push({ status: 503, error: 'No healthy backend nodes available' });
+      continue;
+    }
+
+    try {
+      const result = await processByNode(node, {
+        resourceId,
+        content: `Resource payload for ${resourceId}`
+      });
+
+      const response = {
+        concept: 'load-balancing',
+        cache: 'miss',
+        strategy: state.strategy,
+        servedBy: result.nodeId,
+        delay: result.delay,
+        data: result.payload
+      };
+
+      setCache(resourceId, response);
+      results.push({ status: 200, cache: 'miss', servedBy: result.nodeId, delay: result.delay });
+    } catch (error) {
+      results.push({ status: 502, error: error.message });
+    }
+  }
+
+  return res.json({
+    concept: 'traffic-burst',
+    total,
+    results
+  });
 });
 
 app.get('/api/resource/:id', async (req, res) => {
@@ -196,7 +320,10 @@ app.get('/api/resource/:id', async (req, res) => {
     return res.json({
       concept: 'caching',
       cache: 'hit',
-      data: cached.value
+      servedBy: 'cache',
+      strategy: state.strategy,
+      delay: 0,
+      data: cached.value.data
     });
   }
 
@@ -250,48 +377,39 @@ app.post('/api/jobs', (req, res) => {
   });
 });
 
-app.post('/api/jobs/process', async (req, res) => {
+app.post('/api/jobs/process', (req, res) => {
   const nextJob = state.queue.shift();
   if (!nextJob) {
     return res.json({ concept: 'messaging-queue', message: 'No jobs in queue' });
   }
 
-  const retryLimit = 3;
+  const retryLimit = state.retryStormMode ? 6 : 3;
+  const failureChance = state.retryStormMode ? 0.8 : 0.45;
 
   while (nextJob.attempts < retryLimit) {
     nextJob.attempts += 1;
-    const shouldFail = Math.random() < 0.45;
+    const shouldFail = Math.random() < failureChance;
 
     if (!shouldFail) {
       nextJob.status = 'processed';
       nextJob.processedAt = now();
       state.processedJobs.unshift(nextJob);
       return res.json({
-        concept: 'retries',
+        concept: nextJob.attempts > 1 ? 'retries' : 'messaging-queue',
         message: 'Job processed successfully',
         job: nextJob
       });
     }
   }
 
-  nextJob.status = 'failed-after-retries';
+  nextJob.status = 'dead-lettered';
+  nextJob.failedAt = now();
+  state.deadLetterJobs.unshift(nextJob);
   state.processedJobs.unshift(nextJob);
   return res.status(500).json({
     concept: 'retry-storm',
-    message: 'Job failed after retries',
+    message: 'Job failed after retries and moved to dead letter queue',
     job: nextJob
-  });
-});
-
-app.get('/api/dashboard', (req, res) => {
-  res.json({
-    strategy: state.strategy,
-    rateLimitPerMinute: state.rateLimitPerMinute,
-    queueDepth: state.queue.length,
-    processedJobs: state.processedJobs.slice(0, 8),
-    cacheKeys: Array.from(state.cache.keys()),
-    nodes: state.nodes,
-    requestsThisMinute: state.requestLog.length
   });
 });
 
