@@ -19,7 +19,9 @@ const eventTone = {
   node: 'accent',
   burst: 'accent',
   config: 'accent',
-  reset: 'good'
+  reset: 'good',
+  circuit: 'warn',
+  backpressure: 'danger'
 };
 
 async function api(path, options = {}) {
@@ -36,6 +38,40 @@ async function api(path, options = {}) {
     throw new Error(data.error || data.message || 'Request failed');
   }
   return data;
+}
+
+function MiniBarChart({ data }) {
+  const max = Math.max(1, ...data.map((item) => item.requests));
+  return (
+    <div className="chart-bars">
+      {data.map((item) => (
+        <div key={item.name} className="chart-bar-col">
+          <div className="chart-bar-stack">
+            <div className="chart-bar-fill" style={{ height: `${(item.requests / max) * 100}%` }} />
+          </div>
+          <strong>{item.requests}</strong>
+          <span>{item.name.replace('api-node-', '')}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function TimelineChart({ series }) {
+  const points = series.slice(-12);
+  const max = Math.max(1, ...points.map((item) => item.perNode.reduce((sum, node) => sum + node.totalRequests, 0)));
+  return (
+    <div className="timeline-chart">
+      {points.map((point, index) => {
+        const total = point.perNode.reduce((sum, node) => sum + node.totalRequests, 0);
+        return (
+          <div key={`${point.ts}-${index}`} className="timeline-point-wrap">
+            <div className={`timeline-point result-${point.result}`} style={{ height: `${Math.max(18, (total / max) * 100)}%` }} />
+          </div>
+        );
+      })}
+    </div>
+  );
 }
 
 export default function App() {
@@ -58,13 +94,14 @@ export default function App() {
   const queue = snapshot?.queue || [];
   const deadLetterQueue = snapshot?.deadLetterQueue || [];
   const metrics = snapshot?.metrics;
+  const charts = snapshot?.charts;
 
   const headlineMetrics = useMemo(() => {
     if (!snapshot || !config || !metrics) return [];
     return [
       { label: 'Strategy', value: config.strategy },
       { label: 'Healthy nodes', value: `${metrics.healthyNodes}/${metrics.totalNodes}` },
-      { label: 'Cache keys', value: snapshot.cache.size },
+      { label: 'Open circuits', value: metrics.circuitOpenCount },
       { label: 'Queued jobs', value: queue.length }
     ];
   }, [snapshot, config, metrics, queue.length]);
@@ -192,7 +229,8 @@ export default function App() {
           <h1>Steer the control room. Watch the system bend.</h1>
           <p className="intro">
             This playground turns abstract scaling topics into visible behavior: cache hits,
-            failover, throttling, queue retries, dead-letter traffic, and shifting load across nodes.
+            failover, throttling, queue retries, dead-letter traffic, circuit breaker trips,
+            backpressure rejection, and shifting load across nodes.
           </p>
           <div className="hero-actions">
             <button className="primary" onClick={fetchResource} disabled={loading}>Fetch sample resource</button>
@@ -207,7 +245,7 @@ export default function App() {
           {nodes.slice(0, 6).map((node, index) => (
             <div
               key={node.id}
-              className={`radar-node ${node.healthy ? '' : 'offline'}`}
+              className={`radar-node ${node.healthy ? '' : 'offline'} ${node.circuitState === 'open' ? 'tripped' : ''}`}
               style={{ '--x': `${18 + (index % 3) * 28}%`, '--y': `${20 + Math.floor(index / 3) * 34}%` }}
             >
               <span>{node.name.replace('api-node-', '')}</span>
@@ -246,13 +284,37 @@ export default function App() {
             </select>
           </label>
 
+          <div className="toggle-grid">
+            <button onClick={() => updateConfig({ circuitBreakerEnabled: !config?.circuitBreakerEnabled })} disabled={loading}>
+              Circuit breaker: {config?.circuitBreakerEnabled ? 'on' : 'off'}
+            </button>
+            <button onClick={() => updateConfig({ backpressureEnabled: !config?.backpressureEnabled })} disabled={loading}>
+              Backpressure: {config?.backpressureEnabled ? 'on' : 'off'}
+            </button>
+          </div>
+
+          <label className="field">
+            <span>Max in-flight per node</span>
+            <input
+              type="number"
+              min="1"
+              max="20"
+              value={config?.maxInFlightPerNode || 4}
+              onChange={(e) => updateConfig({ maxInFlightPerNode: Number(e.target.value) })}
+            />
+          </label>
+
           <div className="node-list">
             {nodes.map((node) => (
               <article key={node.id} className="node-card">
                 <div className="node-topline">
                   <div>
                     <h3>{node.name}</h3>
-                    <p>{node.healthy ? 'Healthy' : 'Offline for failover test'}</p>
+                    <p>
+                      {node.healthy ? 'Healthy' : 'Offline for failover test'}
+                      {' · '}
+                      circuit: {node.circuitState}
+                    </p>
                   </div>
                   <button onClick={() => toggleNode(node.id)} disabled={loading}>
                     {node.healthy ? 'Take offline' : 'Restore'}
@@ -262,7 +324,7 @@ export default function App() {
                   <div><dt>Weight</dt><dd>{node.weight}</dd></div>
                   <div><dt>Base latency</dt><dd>{node.baseLatencyMs} ms</dd></div>
                   <div><dt>Handled</dt><dd>{node.totalRequests}</dd></div>
-                  <div><dt>In flight</dt><dd>{node.inFlight}</dd></div>
+                  <div><dt>Failures</dt><dd>{node.failedRequests}</dd></div>
                 </dl>
               </article>
             ))}
@@ -352,6 +414,17 @@ export default function App() {
             </button>
           </div>
 
+          <label className="field">
+            <span>Queue capacity</span>
+            <input
+              type="number"
+              min="1"
+              max="100"
+              value={config?.queueCapacity || 12}
+              onChange={(e) => updateConfig({ queueCapacity: Number(e.target.value) })}
+            />
+          </label>
+
           <div className="queue-summary">
             <div>
               <span>Queue depth</span>
@@ -371,6 +444,27 @@ export default function App() {
                 <small>{entry.attempts ? `attempts: ${entry.attempts}` : 'queued'}</small>
               </article>
             ))}
+          </div>
+        </section>
+
+        <section className="panel panel-wide">
+          <div className="panel-head">
+            <div>
+              <p className="panel-kicker">Request graphs</p>
+              <h2>Distribution and trend</h2>
+            </div>
+            <span>See which nodes are actually carrying traffic</span>
+          </div>
+
+          <div className="charts-grid">
+            <div className="subpanel chart-panel">
+              <h3>Requests per node</h3>
+              <MiniBarChart data={charts?.nodeTotals || []} />
+            </div>
+            <div className="subpanel chart-panel">
+              <h3>Recent request timeline</h3>
+              <TimelineChart series={charts?.requestSeries || []} />
+            </div>
           </div>
         </section>
 
