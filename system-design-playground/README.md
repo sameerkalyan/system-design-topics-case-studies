@@ -16,6 +16,9 @@ This app is designed to make common interview and production topics visible inst
 - queue processing
 - retries and retry storms
 - dead-letter queue behavior
+- circuit breaker simulation
+- backpressure and saturation behavior
+- request distribution charts
 - event logging and system-state inspection
 
 ## Project structure
@@ -44,8 +47,11 @@ The backend exposes a small simulation API that lets the frontend:
 - toggle node health to force failover scenarios
 - fetch resources through a balancer and observe cache hits or misses
 - simulate burst traffic and rate-limit pressure
+- enforce backpressure on saturated nodes and full queues
+- open and close node circuit breakers after repeated failures
 - enqueue jobs and process them through retries
 - move repeatedly failing jobs into a dead-letter queue
+- return request-series metrics for charts
 - reset the environment back to defaults
 
 ## Frontend behavior
@@ -60,7 +66,10 @@ The frontend is a dashboard-style control room where you can:
 - run burst traffic and observe accepted vs throttled requests
 - enqueue jobs and process them in batches
 - enable retry storm mode to increase failure pressure
+- toggle circuit breaker behavior
+- toggle backpressure mode and saturate the queue
 - inspect recent system events in a single log panel
+- view live request distribution charts
 
 ## How to run
 
@@ -72,8 +81,6 @@ From the playground root:
 cd system-design-playground
 npm run install:all
 ```
-
-Or install each side separately if you prefer.
 
 ### 2. Start the backend
 
@@ -108,9 +115,10 @@ Vite will print the local frontend URL in your terminal.
 5. Switch to **least connections** and compare how traffic shifts.
 6. Add a slower or heavier-weighted node and test **weighted round robin**.
 7. Lower the rate limit and run a burst to trigger throttling.
-8. Enqueue several jobs and process them normally.
-9. Turn on **retry storm** and process more jobs.
-10. Watch failing jobs cycle and eventually land in the dead-letter queue.
+8. Turn on **backpressure** and drive the system into saturation.
+9. Turn on **circuit breaker** and watch overloaded nodes get opened.
+10. Enqueue several jobs, trigger retry storm mode, and watch failures move into the dead-letter queue.
+11. Inspect the charts to compare distribution and failure buildup over time.
 
 ## API summary
 
@@ -129,7 +137,9 @@ Example body:
   "strategy": "least-connections",
   "cacheEnabled": true,
   "rateLimitPerWindow": 8,
-  "retryStormEnabled": false
+  "retryStormEnabled": false,
+  "circuitBreakerEnabled": true,
+  "backpressureEnabled": true
 }
 ```
 
@@ -154,14 +164,10 @@ Example body:
 
 ## Good next extensions
 
-If you want to grow this further, the most natural next steps are:
-
 - sticky sessions
-- circuit breaker simulation
-- outbox pattern demo
 - replica lag and read replicas
 - consistent hashing visualization
 - shard-router simulation
-- per-node charts over time
-- distributed cache vs local cache comparison
-- Kafka-style partitioning demo
+- outbox pattern demo
+- per-node latency histograms
+- storage-layer or Kafka-style partition demos
